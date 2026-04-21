@@ -35,7 +35,7 @@ def scan_wellsky(file):
     for _, row in df.iterrows():
         # Identify Name Row: Col 1 = ID, Col 5 = Last, Col 9 = First
         last_val = str(row.iloc[5]).strip() if len(row) > 5 else ""
-        first_val = str(row.iloc[9]).strip() if len(row) > 9 else ""
+        first_val = str(row.iloc[10]).strip() if len(row) > 10 else ""
         id_val = str(row.iloc[1]).strip() if len(row) > 1 else ""
         
         # Check if row contains a client (ID is numeric and Last Name exists)
