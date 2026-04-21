@@ -2,11 +2,11 @@ import streamlit as st
 import pandas as pd
 import re
 
-st.set_index_config = {"page_title": "Data Matcher", "layout": "wide"}
+st.set_page_config(page_title="Data Matcher", layout="wide")
 st.title("📊 Servtracker vs. Wellsky Matcher")
 
 def clean_key(text):
-    if pd.isna(text): return ""
+    if pd.isna(text) or text == "": return ""
     return re.sub(r'[^a-z]', '', str(text).lower())
 
 col1, col2 = st.columns(2)
@@ -17,59 +17,74 @@ with col2:
 
 if serv_file and well_file:
     try:
-        # 1. SERVTRACKER
+        # --- 1. SERVTRACKER: Dynamic Column Search ---
         df_s_raw = pd.read_excel(serv_file)
-        s_data = df_s_raw.iloc[5:].copy()
+        # Find the column that contains 'Totals' or has the units
+        # We'll look for the first row that looks like data
         s_list = []
-        for _, row in s_data.iterrows():
-            name = str(row.iloc[0])
+        for _, row in df_s_raw.iterrows():
+            row_list = [str(x) for x in row.values]
+            name = row_list[0]
             if "," in name and "Total" not in name:
-                val = pd.to_numeric(row.iloc[108], errors='coerce') or 0
-                if val > 0:
-                    s_list.append({'Name': name, 'Key': clean_key(name), 'Serv': val})
+                # Instead of index 108, find the LAST numeric value in the row
+                nums = [pd.to_numeric(x, errors='coerce') for x in row.values if pd.notna(x)]
+                valid_nums = [n for n in nums if n is not None and 0 < n < 500]
+                if valid_nums:
+                    s_list.append({'Name': name, 'Key': clean_key(name), 'Serv': valid_nums[-1]})
         df_s = pd.DataFrame(s_list)
 
-        # 2. WELLSKY (Targeting specific layout found in your CSV)
+        # --- 2. WELLSKY: Flexible Scanner ---
         try:
-            # Wellsky files often have different headers; read without them first
-            well_df = pd.read_csv(well_file, header=None, encoding='latin1', on_bad_lines='skip')
+            # Try HTML first (common Wellsky format)
+            well_df = pd.read_html(well_file)[0]
         except:
             well_file.seek(0)
-            well_df = pd.read_excel(well_file, header=None)
+            # Fallback to CSV/Excel
+            try:
+                well_df = pd.read_excel(well_file, header=None)
+            except:
+                well_file.seek(0)
+                well_df = pd.read_csv(well_file, header=None, encoding='latin1', on_bad_lines='skip')
 
         w_list = []
         current_key = None
 
         for _, row in well_df.iterrows():
-            # A. Find Name: ID is in Col 1, Last Name in Col 4, First Name in Col 9
-            client_id = str(row.iloc[1])
-            if client_id.isdigit() and len(client_id) > 5:
-                last_name = str(row.iloc[4])
-                first_name = str(row.iloc[9])
-                current_key = clean_key(last_name + first_name)
+            row_items = [str(x).strip() for x in row.values]
+            row_str = " ".join(row_items)
 
-            # B. Find Sub Total: It's in the row where Col 17 says 'Sub Total:'
-            # The actual units are in Col 19
-            row_text = str(row.iloc[17])
-            if "Sub Total" in row_text and current_key:
-                try:
-                    units = float(str(row.iloc[19]).replace(',', ''))
-                    w_list.append({'Key': current_key, 'Well': units})
-                    current_key = None 
-                except: continue
+            # A. Find Name: Look for a row with an ID (digits) and text
+            if any(x.isdigit() and len(x) > 5 for x in row_items):
+                # Join any text parts that look like names (usually cols 4 and 9)
+                text_parts = [x for x in row_items if x.isalpha() and len(x) > 1]
+                if len(text_parts) >= 2:
+                    current_key = clean_key("".join(text_parts[:3]))
+
+            # B. Find Total: Look for 'Sub Total' or 'Total' and grab the number next to it
+            if "total" in row_str.lower() and current_key:
+                nums = []
+                for x in row_items:
+                    clean_n = re.sub(r'[^\d.]', '', x)
+                    if clean_n and clean_n != '.':
+                        try:
+                            nums.append(float(clean_n))
+                        except: continue
+                if nums:
+                    w_list.append({'Key': current_key, 'Well': nums[-1]})
+                    current_key = None
 
         df_w = pd.DataFrame(w_list).groupby('Key').sum().reset_index() if w_list else pd.DataFrame(columns=['Key', 'Well'])
 
-        # 3. MERGE
+        # --- 3. MERGE ---
         if not df_s.empty:
             final = pd.merge(df_s, df_w, on='Key', how='left').fillna(0)
             final['Diff'] = final['Serv'] - final['Well']
             
-            st.success(f"Successfully matched {len(df_w)} clients from Wellsky.")
-            st.dataframe(final[['Name', 'Serv', 'Well', 'Diff']], use_container_width=True)
+            st.success(f"Matched {len(df_w)} clients.")
+            st.dataframe(final[['Name', 'Serv', 'Well', 'Diff']].sort_values('Diff', ascending=False), use_container_width=True)
             
             csv = final.to_csv(index=False).encode('utf-8')
             st.download_button("📥 Download Results", csv, "Match_Results.csv", "text/csv")
         
     except Exception as e:
-        st.error(f"Error: {e}")
+        st.error(f"Error Details: {e}")
