@@ -22,7 +22,7 @@ def get_clean_key(last, first):
     first_name = str(first).strip().split()[0] if first and not pd.isna(first) else ""
     return clean(last) + clean(first_name)
 
-# --- 2. UPDATED WELLSKY SCANNER (Minimum Value Logic) ---
+# --- 2. FINAL WELLSKY SCANNER (Memory + Min Value + Correct Columns) ---
 def scan_wellsky(file):
     if file.name.lower().endswith('.csv'):
         df = pd.read_csv(file, header=None, encoding="latin1")
@@ -33,9 +33,9 @@ def scan_wellsky(file):
     current_key = None
     
     for _, row in df.iterrows():
-        # Identify Name Row: Col 1 = ID, Col 5 = Last, Col 9 = First
+        # Identify Name Row: Col 1 = ID, Col 5 = Last, Col 10 = First
         last_val = str(row.iloc[5]).strip() if len(row) > 5 else ""
-        first_val = str(row.iloc[10]).strip() if len(row) > 10 else ""
+        first_val = str(row.iloc[10]).strip() if len(row) > 10 else "" # Fixed Index to 10
         id_val = str(row.iloc[1]).strip() if len(row) > 1 else ""
         
         # Check if row contains a client (ID is numeric and Last Name exists)
@@ -61,11 +61,10 @@ def scan_wellsky(file):
                     continue
             
             if nums:
-                # CRITICAL FIX: Units are almost always the smallest number in the subtotal row
-                # (e.g., Units: 56, Billed: $451.00 -> 56 is the correct value)
+                # Units are almost always the smallest number in the subtotal row
                 units = min(nums)
                 records.append({"Key": current_key, "Well": units})
-                # We don't reset current_key here to allow for multiple service subtotals per person
+                # Do not reset current_key to allow multiple sub-totals per person
 
     if not records: 
         return pd.DataFrame(columns=["Key", "Well"])
