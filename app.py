@@ -5,10 +5,13 @@ import re
 st.set_page_config(page_title="Data Reconciliation Tool", layout="wide")
 st.title("📊 Servtracker vs. Wellsky Reconciliation")
 
-def clean_key(name):
-    """Standardizes names: removes everything but letters and makes lowercase."""
-    if pd.isna(name): return ""
-    return re.sub(r'[^a-zA-Z]', '', str(name)).lower()
+def make_key(text):
+    """Standardizes names into a simple key (e.g., 'adamschr')"""
+    if pd.isna(text) or text == "": return ""
+    text = str(text).lower()
+    # Remove all non-letters
+    clean = re.sub(r'[^a-z]', '', text)
+    return clean
 
 col1, col2 = st.columns(2)
 
@@ -24,77 +27,80 @@ if serv_file and well_file:
         sheet = "rptAccumulativeMonthly" if "rptAccumulativeMonthly" in serv_xlsx.sheet_names else serv_xlsx.sheet_names[0]
         df_serv = pd.read_excel(serv_file, sheet_name=sheet)
         
-        # Servtracker columns: 0 is Name, 108 is units
+        # Start data from row 5
         serv_data = df_serv.iloc[5:].copy()
+        # Col 0: Name, Col 108: Units
         serv_final = serv_data[[serv_data.columns[0], serv_data.columns[108]]].copy()
         serv_final.columns = ['Client Name', 'Servtracker']
         serv_final = serv_final[serv_final['Client Name'].str.contains(',', na=False)]
-        serv_final['MatchKey'] = serv_final['Client Name'].apply(clean_key)
+        
+        # Create the MatchKey
+        serv_final['MatchKey'] = serv_final['Client Name'].apply(make_key)
         serv_final['Servtracker'] = pd.to_numeric(serv_final['Servtracker'], errors='coerce').fillna(0)
 
-        # --- 2. PROCESS WELLSKY (Robust Scanner) ---
-        well_bytes = well_file.read()
+        # --- 2. PROCESS WELLSKY (The 'Deep Scan' Method) ---
+        # We will try to read the file as HTML first (standard for Wellsky XLS)
         try:
-            content = well_bytes.decode('utf-8')
+            well_df = pd.read_html(well_file)[0]
         except:
-            content = well_bytes.decode('latin1')
-            
-        lines = content.splitlines()
-        wellsky_list = []
-        current_name = None
-        
-        for line in lines:
-            clean_line = line.strip()
-            if not clean_line: continue
-            
-            # Look for a Client Name (Usually contains a comma and is near a long ID)
-            # Example: "1234567, Doe, John" or "Doe, John"
-            if "," in clean_line and any(char.isdigit() for char in clean_line):
-                # Try to extract the name pattern "LastName, FirstName"
-                match = re.search(r'([A-Za-z\s\'-]+,\s*[A-Za-z\s\'-]+)', clean_line)
-                if match:
-                    current_name = match.group(1)
+            well_file.seek(0)
+            well_df = pd.read_csv(well_file, header=None, sep=None, engine='python', encoding='latin1')
 
-            # Look for the units line (Look for "Total" or "Sub Total" case-insensitive)
-            if ("total" in clean_line.lower()) and current_name:
-                # Find all numbers (including decimals) in the line
-                # Wellsky totals usually look like: "Sub Total: 20.00" or just "... 20"
-                nums = re.findall(r'(\d+\.\d+|\d+)', clean_line)
+        well_records = []
+        current_name_key = None
+        
+        # Iterate through every row in the Wellsky file
+        for index, row in well_df.iterrows():
+            row_list = [str(x) for x in row.values]
+            row_text = " ".join(row_list)
+
+            # A: Find a name row
+            # Wellsky client lines usually have a long ID (6-10 digits) and a comma
+            if re.search(r'\d{6,}', row_text) and "," in row_text:
+                # Find the column that actually contains the comma (the name)
+                for cell in row_list:
+                    if "," in cell and not any(kw in cell for kw in ["Total", "Report", "Date"]):
+                        current_name_key = make_key(cell)
+                        break
+            
+            # B: Find a total row
+            if "Total" in row_text and current_name_key:
+                # Extract all numbers from the row
+                nums = re.findall(r'(\d+\.\d+|\d+)', row_text)
                 if nums:
-                    # We take the number that looks most like a 'unit' count
-                    # Usually it's the last number on the Sub Total line
-                    unit_val = float(nums[-1])
-                    
-                    # Only count it if it's a reasonable number (not a year or ID)
-                    if unit_val < 500: 
-                        wellsky_list.append({
-                            'MatchKey': clean_key(current_name),
-                            'Wellsky': unit_val
-                        })
-                        # Optional: Clear name after finding total to prevent double-counting
-                        current_name = None
+                    # Usually the unit total is the last number on the 'Sub Total' line
+                    try:
+                        val = float(nums[-1])
+                        # Filter out numbers that are too big to be units (like IDs or years)
+                        if 0 < val < 1000:
+                            well_records.append({'MatchKey': current_name_key, 'Wellsky': val})
+                    except: pass
 
-        if wellsky_list:
-            df_well_processed = pd.DataFrame(wellsky_list).groupby('MatchKey').sum().reset_index()
+        if well_records:
+            well_summary = pd.DataFrame(well_records).groupby('MatchKey').sum().reset_index()
         else:
-            df_well_processed = pd.DataFrame(columns=['MatchKey', 'Wellsky'])
+            well_summary = pd.DataFrame(columns=['MatchKey', 'Wellsky'])
 
-        # --- 3. MERGE & RESULTS ---
-        final_report = pd.merge(serv_final, df_well_processed, on='MatchKey', how='left')
-        final_report['Wellsky'] = final_report['Wellsky'].fillna(0)
-        final_report['Difference'] = final_report['Servtracker'] - final_report['Wellsky']
+        # --- 3. MERGE ---
+        # Join on MatchKey
+        final = pd.merge(serv_final, well_summary, on='MatchKey', how='left')
+        final['Wellsky'] = final['Wellsky'].fillna(0)
+        final['Difference'] = final['Servtracker'] - final['Wellsky']
 
-        # Sort by those with the biggest differences
-        final_report = final_report.sort_values(by="Difference", ascending=False)
+        # Sorting: People with differences first
+        final = final.sort_values(by='Difference', ascending=False)
 
-        st.success(f"Success! Found {len(df_well_processed)} clients in Wellsky.")
+        st.success(f"Matched {len(well_summary)} unique clients from Wellsky.")
+        st.dataframe(final[['Client Name', 'Servtracker', 'Wellsky', 'Difference']], use_container_width=True)
         
-        # Display the table
-        st.dataframe(final_report[['Client Name', 'Servtracker', 'Wellsky', 'Difference']], use_container_width=True)
-        
-        # Download Button
-        csv = final_report[['Client Name', 'Servtracker', 'Wellsky', 'Difference']].to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Download Final Report", csv, "Reconciliation_Report.csv", "text/csv")
+        # --- 4. DEBUG SECTION (In case of 0s) ---
+        if len(well_summary) == 0:
+            st.warning("⚠️ No data was found in the Wellsky file. This usually means the file format is protected or different than expected.")
+            st.write("First 5 rows of Wellsky file for diagnosis:")
+            st.write(well_df.head())
+
+        csv = final.to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Download Results", csv, "Reconciliation.csv", "text/csv")
 
     except Exception as e:
-        st.error(f"An error occurred: {e}")
+        st.error(f"Critical Error: {e}")
