@@ -1,176 +1,103 @@
 import streamlit as st
 import pandas as pd
 import re
-from io import BytesIO
 
 st.set_page_config(page_title="Data Matcher", layout="wide")
-st.title("📊 Servtracker vs WellSky Matcher")
-st.caption("Robust reconciliation tool with flexible parsing and safer matching")
+st.title("📊 Servtracker vs. Wellsky Matcher")
 
-
-def clean_key(text: str) -> str:
-    """Normalize names so formatting differences still match."""
-    if pd.isna(text) or text is None:
-        return ""
-    text = str(text).lower()
-    text = re.sub(r"[^a-z ]", " ", text)
-    parts = sorted([p for p in text.split() if p])
-    return "".join(parts)
-
-
-
-def extract_name_from_cell(cell: str):
-    """Extract name from formats like 'Last, First' or 'First Last'."""
-    if not cell or cell == "nan":
-        return None
-
-    cell = str(cell).strip()
-
-    if "," in cell:
-        parts = [p.strip() for p in cell.split(",")]
-        if len(parts) >= 2:
-            return parts[0], parts[1]
-
-    words = re.findall(r"[A-Za-z]+", cell)
-    if len(words) >= 2:
-        return words[-1], words[0]
-
-    return None
-
-
-
-def process_servtracker(file):
-    df_raw = pd.read_excel(file)
-    records = []
-
-    for _, row in df_raw.iloc[5:].iterrows():
-        try:
-            name = str(row.iloc[0]).strip()
-            if "," not in name or "total" in name.lower():
-                continue
-
-            units = pd.to_numeric(row.iloc[108], errors="coerce")
-            if pd.notna(units) and units > 0:
-                records.append({
-                    "Name": name,
-                    "Key": clean_key(name),
-                    "Serv": float(units)
-                })
-        except Exception:
-            continue
-
-    return pd.DataFrame(records)
-
-
-
-def read_wellsky_file(file):
-    """Try multiple read methods for maximum compatibility."""
-    filename = file.name.lower()
-
-    if filename.endswith(".csv"):
-        file.seek(0)
-        return pd.read_csv(file, header=None, encoding="latin1", on_bad_lines="skip")
-
-    try:
-        file.seek(0)
-        return pd.read_excel(file, header=None)
-    except Exception:
-        file.seek(0)
-        return pd.read_csv(file, header=None, encoding="latin1", on_bad_lines="skip")
-
-
-
-def process_wellsky(file):
-    df = read_wellsky_file(file)
-
-    records = []
-    current_key = None
-
-    for _, row in df.iterrows():
-        row_vals = [str(x).strip() for x in row.values if str(x).strip() != "nan"]
-        row_text = " | ".join(row_vals)
-
-        # Find patient/client name anywhere in row
-        for cell in row_vals:
-            extracted = extract_name_from_cell(cell)
-            if extracted:
-                last_name, first_name = extracted
-                current_key = clean_key(f"{last_name} {first_name}")
-                break
-
-        # Find subtotal / units anywhere in row
-        if current_key and "sub total" in row_text.lower():
-            nums = re.findall(r"\d+\.?\d*", row_text)
-            if nums:
-                units = float(nums[-1])
-                records.append({
-                    "Key": current_key,
-                    "Well": units
-                })
-
-    if not records:
-        return pd.DataFrame(columns=["Key", "Well"])
-
-    return pd.DataFrame(records).groupby("Key", as_index=False).sum()
-
-
-
-def reconcile(serv_df, well_df):
-    final = pd.merge(serv_df, well_df, on="Key", how="left").fillna(0)
-    final["Diff"] = final["Serv"] - final["Well"]
-
-    return final[["Name", "Serv", "Well", "Diff"]].sort_values(
-        by="Diff", ascending=False
-    )
-
+def get_strict_key(full_name):
+    """
+    Turns 'Adams, Thomas B' into 'adamsthomas'.
+    Turns 'Adhikari, Dhan' into 'adhikaridhan'.
+    """
+    if pd.isna(full_name) or not full_name: return ""
+    name_str = str(full_name).lower()
+    if "," in name_str:
+        last, first_part = name_str.split(",", 1)
+        # Take only the first word of the first name (ignores middle initials)
+        first = first_part.strip().split(" ")[0]
+        return re.sub(r'[^a-z]', '', last + first)
+    return re.sub(r'[^a-z]', '', name_str)
 
 col1, col2 = st.columns(2)
-
 with col1:
-    serv_file = st.file_uploader(
-        "1. Upload Servtracker Report",
-        type=["xlsx"],
-        key="serv"
-    )
-
+    serv_file = st.file_uploader("1. Upload Servtracker", type=['xlsx'])
 with col2:
-    well_file = st.file_uploader(
-        "2. Upload WellSky Report",
-        type=["xls", "xlsx", "csv"],
-        key="well"
-    )
-
+    well_file = st.file_uploader("2. Upload Wellsky", type=['xls', 'csv'])
 
 if serv_file and well_file:
     try:
-        with st.spinner("Processing files..."):
-            df_serv = process_servtracker(serv_file)
-            df_well = process_wellsky(well_file)
+        # --- 1. SERVTRACKER ---
+        df_s_raw = pd.read_excel(serv_file)
+        s_list = []
+        # Name is in Col 0, Units in Col 108
+        for _, row in df_s_raw.iloc[5:].iterrows():
+            name = str(row.iloc[0])
+            if "," in name and "Total" not in name:
+                val = pd.to_numeric(row.iloc[108], errors='coerce') or 0
+                if val > 0:
+                    s_list.append({
+                        'Name': name, 
+                        'Key': get_strict_key(name), 
+                        'Serv': val
+                    })
+        df_s = pd.DataFrame(s_list)
 
-            if df_serv.empty:
-                st.error("No valid records found in Servtracker file.")
-                st.stop()
+        # --- 2. WELLSKY SCANNER ---
+        try:
+            well_df = pd.read_csv(well_file, header=None, encoding='latin1', on_bad_lines='skip')
+        except:
+            well_file.seek(0)
+            well_df = pd.read_excel(well_file, header=None)
 
-            result = reconcile(df_serv, df_well)
+        w_list = []
+        current_key = None
 
-        matched = (result["Well"] > 0).sum()
-        discrepancies = (result["Diff"] != 0).sum()
+        for _, row in well_df.iterrows():
+            # Convert row to list and skip the first 'index' column if it exists
+            cells = [str(c).strip() for c in row.values]
+            row_str = " ".join(cells)
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Servtracker Records", len(df_serv))
-        c2.metric("WellSky Matches", matched)
-        c3.metric("Discrepancies", discrepancies)
+            # A. Find the Person Row (Look for the long ID number)
+            # In your file, ID is at index 2 or 3. We'll search for any long digit.
+            ids = [c for c in cells if c.isdigit() and len(c) >= 7]
+            if ids:
+                # Find alphabetic cells for names. 
+                # In your file: Last is index 6, First is index 11.
+                try:
+                    last = cells[6] if len(cells) > 6 else ""
+                    first = cells[11] if len(cells) > 11 else ""
+                    current_key = re.sub(r'[^a-z]', '', (last + first).lower())
+                except: continue
 
-        st.success("Reconciliation completed successfully")
-        st.dataframe(result, use_container_width=True)
+            # B. Find the Units (Look for "Sub Total")
+            if "Sub Total" in row_str and current_key:
+                # Units are in the cell at index 20
+                try:
+                    units_val = cells[20] if len(cells) > 20 else "0"
+                    units_clean = re.sub(r'[^\d.]', '', units_val)
+                    if units_clean:
+                        w_list.append({'Key': current_key, 'Well': float(units_clean)})
+                except: pass
+                # We don't reset current_key here in case there are multiple sub-totals
 
-        csv_data = result.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "📥 Download Reconciliation Report",
-            data=csv_data,
-            file_name="reconciliation_report.csv",
-            mime="text/csv"
-        )
+        # Group and sum Wellsky units
+        df_w = pd.DataFrame(w_list).groupby('Key').sum().reset_index() if w_list else pd.DataFrame(columns=['Key', 'Well'])
+
+        # --- 3. MERGE ---
+        if not df_s.empty:
+            final = pd.merge(df_s, df_w, on='Key', how='left').fillna(0)
+            final['Diff'] = final['Serv'] - final['Well']
+            
+            st.success(f"Matched {len(final[final['Well'] > 0])} out of {len(df_s)} clients.")
+            
+            display_df = final[['Name', 'Serv', 'Well', 'Diff']].sort_values('Diff', ascending=False)
+            st.dataframe(display_df, use_container_width=True)
+            
+            csv = display_df.to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Download Final Report", csv, "Reconciliation_Report.csv", "text/csv")
+        else:
+            st.warning("No valid data found in Servtracker file.")
 
     except Exception as e:
-        st.error(f"Processing failed: {str(e)}")
+        st.error(f"Error: {e}")
