@@ -10,14 +10,13 @@ st.title("📊 Universal Servtracker vs. WellSky Matcher")
 def get_clean_key(last, first):
     def sanitize(text):
         text = str(text).lower()
-        # Remove suffixes and extra descriptors often found in Servtracker
+        # Remove suffixes and extra descriptors
         text = re.sub(r'\b(jr|sr|ii|iii|iv|v|inc|jr\.|sr\.)\b', '', text)
         return re.sub(r'[^a-z]', '', text)
     return sanitize(last) + sanitize(first)
 
 # --- 2. THE SERVTRACKER SCANNER ---
 def scan_servtracker(file):
-    # Support for xls, xlsx, and csv
     if file.name.lower().endswith('.csv'):
         df = pd.read_csv(file, header=None, encoding="latin1")
     else:
@@ -65,15 +64,12 @@ def scan_wellsky(file):
         cells = [str(x).strip() for x in row.values]
         row_str = " ".join(cells).lower()
 
-        # Step A: Find Client Name via Client ID pattern
         id_match = [c for c in cells if re.match(r'^\d{7,10}(\.0)?$', c)]
         if id_match:
-            # Filter out numbers and common labels to find the names
             words = [c for c in cells if c.replace('-', '').isalpha() and len(c) > 1 and c.lower() not in ['client', 'id', 'mi', 'residential', 'address']]
             if len(words) >= 2:
                 current_key = get_clean_key(words[0], words[1])
 
-        # Step B: Find Units via "Sub Total"
         if "sub total" in row_str and current_key:
             nums = []
             for c in cells:
@@ -85,7 +81,6 @@ def scan_wellsky(file):
                     except: pass
             
             if nums:
-                # Usually units is the first number in the subtotal row
                 records.append({"Key": current_key, "Well Units": nums[0]})
                 current_key = None
 
@@ -93,13 +88,10 @@ def scan_wellsky(file):
     return pd.DataFrame(records).groupby("Key", as_index=False).sum()
 
 # --- 4. UI ---
-st.info("The app now accepts .csv, .xlsx, and .xls files.")
 col1, col2 = st.columns(2)
 with col1:
-    # ADDED 'xls' TO TYPE LIST HERE
     file_s = st.file_uploader("1. Servtracker File", type=["csv", "xlsx", "xls"])
 with col2:
-    # ADDED 'xls' TO TYPE LIST HERE
     file_w = st.file_uploader("2. WellSky File", type=["csv", "xlsx", "xls"])
 
 if file_s and file_w:
@@ -110,13 +102,18 @@ if file_s and file_w:
         if df_s.empty:
             st.error("Servtracker file looks empty or formatted incorrectly.")
         else:
+            # Merge files
             final = pd.merge(df_s, df_w, on="Key", how="left").fillna(0)
             
-            # Fuzzy Match Logic
-            unmatched = final[final["Well Units"] == 0].index
-            if len(unmatched) > 0 and not df_w.empty:
+            # FIX: Initialize 'Match Type' immediately to prevent KeyError
+            final["Match Type"] = "No Match"
+            final.loc[final["Well Units"] > 0, "Match Type"] = "Exact Match"
+            
+            # Fuzzy Match Logic for the "No Match" ones
+            unmatched_indices = final[final["Match Type"] == "No Match"].index
+            if len(unmatched_indices) > 0 and not df_w.empty:
                 well_keys = df_w["Key"].tolist()
-                for i in unmatched:
+                for i in unmatched_indices:
                     s_key = final.at[i, "Key"]
                     match = difflib.get_close_matches(s_key, well_keys, n=1, cutoff=0.85)
                     if match:
@@ -125,8 +122,6 @@ if file_s and file_w:
                         final.at[i, "Match Type"] = "Fuzzy Match"
             
             final["Diff"] = final["Serv Units"] - final["Well Units"]
-            final.loc[final["Match Type"].isna(), "Match Type"] = "Exact Match"
-            final.loc[final["Well Units"] == 0, "Match Type"] = "No Match"
 
             # Results Display
             c1, c2, c3 = st.columns(3)
@@ -134,5 +129,10 @@ if file_s and file_w:
             c2.metric("Matches Found", (final["Well Units"] > 0).sum())
             c3.metric("Discrepancies", (final["Diff"] != 0).sum())
 
-            st.dataframe(final[["Full Name", "Serv Units", "Well Units", "Diff", "Match Type"]].sort_values("Diff", ascending=False), use_container_width=True)
-            st.download_button("📥 Download Report", final.to_csv(index=False), "Full_Reconciliation.csv")
+            # Show results
+            display_cols = ["Full Name", "Serv Units", "Well Units", "Diff", "Match Type"]
+            st.dataframe(final[display_cols].sort_values("Diff", ascending=False), use_container_width=True)
+            
+            # Download button
+            csv = final.to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Download Report", csv, "Full_Reconciliation.csv", "text/csv")
