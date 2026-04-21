@@ -8,96 +8,111 @@ st.title("📊 Servtracker vs. Wellsky Matcher")
 def clean_key(text):
     """Turns 'Adams, Thomas ' into 'adamsthomas'"""
     if pd.isna(text): return ""
+    # Standardize: lowercase and remove anything that isn't a letter
     return re.sub(r'[^a-z]', '', str(text).lower())
 
 col1, col2 = st.columns(2)
 with col1:
-    serv_file = st.file_uploader("Upload Servtracker (Excel)", type=['xlsx'])
+    serv_file = st.file_uploader("1. Upload Servtracker (Excel)", type=['xlsx'])
 with col2:
-    well_file = st.file_uploader("Upload Wellsky (XLS/CSV)", type=['xls', 'csv'])
+    well_file = st.file_uploader("2. Upload Wellsky (XLS/CSV)", type=['xls', 'csv'])
 
 if serv_file and well_file:
     try:
-        # 1. PROCESS SERVTRACKER
+        # --- 1. PROCESS SERVTRACKER ---
         df_serv_raw = pd.read_excel(serv_file)
+        # Assuming names start after row 5. 
+        # Column 0 = Names, Column 108 = Units (Servtracker 'Totals')
         serv_data = df_serv_raw.iloc[5:].copy()
+        
         s_list = []
         for _, row in serv_data.iterrows():
             name = str(row.iloc[0])
             if "," in name and "Total" not in name:
+                # Column 108 is the typical location for totals in this report
                 val = pd.to_numeric(row.iloc[108], errors='coerce') or 0
                 if val > 0:
                     s_list.append({'Name': name, 'Key': clean_key(name), 'Serv': val})
+        
         df_s = pd.DataFrame(s_list) if s_list else pd.DataFrame(columns=['Name', 'Key', 'Serv'])
 
-        # 2. PROCESS WELLSKY (The "Table Search" Method)
-        # We try to read the file as an HTML table (standard Wellsky format)
+        # --- 2. PROCESS WELLSKY (Robust Table Search) ---
         try:
-            # This handles the "Expected X fields" error by using an HTML parser
+            # Wellsky files are usually HTML tables disguised as .xls
             tables = pd.read_html(well_file)
             well_df = tables[0]
         except:
-            # Fallback for true CSVs
+            # Fallback if it's a real CSV or text file
             well_file.seek(0)
             well_df = pd.read_csv(well_file, header=None, on_bad_lines='skip', encoding='latin1')
 
         w_list = []
-        current_name = None
+        current_name_key = None
         
-        # We iterate through the table to find the Name -> Sub Total relationship
+        # We go row by row looking for a name, then the units for that name
         for _, row in well_df.iterrows():
-            row_str = " ".join(row.astype(str))
+            # FIXED: This line ensures everything is a string before joining
+            row_items = [str(x) for x in row.values]
+            row_str = " ".join(row_items)
             
-            # A. Find Name: Looking for a row that has a comma and isn't a Total row
-            # Usually column 1 has ID, columns 5/10 have Name
-            if "," in row_str and "Total" not in row_str:
-                # Look for the cell that actually contains the comma (the name)
-                for cell in row:
-                    cell_s = str(cell)
-                    if "," in cell_s and len(cell_s) > 3:
-                        current_name = cell_s
+            # A. Find a potential Name (Usually has a comma and a long ID number)
+            if "," in row_str and any(len(str(x)) > 5 and str(x).isdigit() for x in row.values):
+                # Hunt for the specific cell that has the "Last, First" name
+                for cell in row_items:
+                    if "," in cell and len(cell) > 3 and "Total" not in cell:
+                        current_name_key = clean_key(cell)
                         break
             
-            # B. Find Units: Looking for a row that says "Total" or "Sub Total"
-            if "Total" in row_str and current_name:
-                # Find all numbers in this row
+            # B. Find the Units (Look for 'Total' or 'Sub Total')
+            if "total" in row_str.lower() and current_name_key:
+                # Look through the numbers in this row for the total
                 nums = []
-                for cell in row:
+                for cell in row_items:
                     try:
-                        n = float(str(cell).replace(',', ''))
-                        if 0 < n < 500: nums.append(n)
+                        # Clean the cell of any non-numeric junk except decimals
+                        clean_num = re.sub(r'[^\d.]', '', cell)
+                        if clean_num:
+                            n = float(clean_num)
+                            # Most unit totals are between 1 and 200
+                            if 0 < n < 500: nums.append(n)
                     except: continue
                 
                 if nums:
-                    # Usually the unit total is the last numeric value on the subtotal line
-                    w_list.append({'Key': clean_key(current_name), 'Well': nums[-1]})
-                    current_name = None # Reset for next person
+                    # In Wellsky, the last number in a total row is usually the sum
+                    w_list.append({'Key': current_name_key, 'Well': nums[-1]})
+                    current_name_key = None # Reset for next person
 
-        df_w = pd.DataFrame(w_list).groupby('Key').sum().reset_index() if w_list else pd.DataFrame(columns=['Key', 'Well'])
+        # Clean up Wellsky results
+        if w_list:
+            df_w = pd.DataFrame(w_list).groupby('Key').sum().reset_index()
+        else:
+            df_w = pd.DataFrame(columns=['Key', 'Well'])
 
-        # 3. MERGE & RESULTS
+        # --- 3. MERGE & COMPARE ---
         if not df_s.empty:
             final = pd.merge(df_s, df_w, on='Key', how='left').fillna(0)
             final['Diff'] = final['Serv'] - final['Well']
             
-            # Success Message
+            # Show a success message if we found data
             if not df_w.empty:
-                st.success(f"Matched {len(df_w)} people from Wellsky!")
+                st.success(f"Matched {len(df_w)} clients from the Wellsky file.")
             else:
-                st.warning("⚠️ Connected to files, but found 0 matching units in Wellsky. See Debug view below.")
+                st.warning("⚠️ Files uploaded, but no units were found in the Wellsky file. Check the 'Debug' section below.")
 
-            st.dataframe(final[['Name', 'Serv', 'Well', 'Diff']], use_container_width=True)
+            # Display Table (Sort by those with differences)
+            display_df = final[['Name', 'Serv', 'Well', 'Diff']].sort_values(by="Diff", ascending=False)
+            st.dataframe(display_df, use_container_width=True)
             
-            # Download
-            csv = final.to_csv(index=False).encode('utf-8')
-            st.download_button("📥 Download Results", csv, "Match_Results.csv", "text/csv")
+            # Download Results
+            csv = display_df.to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Download Results", csv, "Reconciliation.csv", "text/csv")
             
-            # DEBUG VIEW (Hidden by default)
-            with st.expander("Debug: See Raw Wellsky Data"):
-                st.write("This is what the script 'sees' in the Wellsky file:")
+            # Hidden Debug View
+            with st.expander("Debug Mode: Raw Wellsky Data"):
+                st.write("This shows the first 20 rows of your Wellsky file so we can see where the columns are:")
                 st.write(well_df.head(20))
         else:
-            st.error("No names found in Servtracker. Check if you uploaded the right file.")
+            st.error("No names found in Servtracker file. Ensure it is the 'Accumulative Monthly' report.")
 
     except Exception as e:
-        st.error(f"Error: {e}")
+        st.error(f"Something went wrong: {e}")
