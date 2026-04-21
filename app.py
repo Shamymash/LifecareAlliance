@@ -22,7 +22,7 @@ def get_clean_key(last, first):
     first_name = str(first).strip().split()[0] if first and not pd.isna(first) else ""
     return clean(last) + clean(first_name)
 
-# --- 2. WELLSKY SCANNER (Stateful Memory Logic) ---
+# --- 2. UPDATED WELLSKY SCANNER (Minimum Value Logic) ---
 def scan_wellsky(file):
     if file.name.lower().endswith('.csv'):
         df = pd.read_csv(file, header=None, encoding="latin1")
@@ -33,13 +33,12 @@ def scan_wellsky(file):
     current_key = None
     
     for _, row in df.iterrows():
-        # WellSky Format: Col 1 = ID, Col 5 = Last Name, Col 9 = First Name
-        # Identify a 'Name Row'
+        # Identify Name Row: Col 1 = ID, Col 5 = Last, Col 9 = First
         last_val = str(row.iloc[5]).strip() if len(row) > 5 else ""
         first_val = str(row.iloc[9]).strip() if len(row) > 9 else ""
         id_val = str(row.iloc[1]).strip() if len(row) > 1 else ""
         
-        # Check if this row contains a client (ID is numeric and Last Name is present)
+        # Check if row contains a client (ID is numeric and Last Name exists)
         is_name_row = id_val.replace('.0','').isdigit() and last_val.lower() not in ["nan", "last name", ""]
         
         if is_name_row:
@@ -48,25 +47,30 @@ def scan_wellsky(file):
         # Identify a 'Sub Total Row'
         row_content = " ".join([str(x).lower() for x in row.values if pd.notna(x)])
         if "sub total:" in row_content and current_key:
-            # Extract units: find the first positive number in the row
-            # (Usually units appear before the cost/billing amounts)
+            nums = []
+            # Scan all columns in the row to find numeric values
             for val in row.values:
                 try:
                     num_str = re.sub(r'[^\d.]', '', str(val))
                     if num_str and num_str != '.':
                         num_val = float(num_str)
-                        if 0 < num_val < 1000: # Filter out IDs or Currency outliers
-                            records.append({"Key": current_key, "Well": num_val})
-                            # We don't reset current_key immediately in case of multiple sub-totals,
-                            # it will be overwritten by the next client's name row.
-                            break 
+                        # Range check to avoid IDs (usually 10 digits) or empty cells
+                        if 0 < num_val < 1000:
+                            nums.append(num_val)
                 except:
                     continue
+            
+            if nums:
+                # CRITICAL FIX: Units are almost always the smallest number in the subtotal row
+                # (e.g., Units: 56, Billed: $451.00 -> 56 is the correct value)
+                units = min(nums)
+                records.append({"Key": current_key, "Well": units})
+                # We don't reset current_key here to allow for multiple service subtotals per person
 
     if not records: 
         return pd.DataFrame(columns=["Key", "Well"])
     
-    # Group by key to sum up units if a client has multiple sub-total entries
+    # Group and sum in case a client appears multiple times in WellSky
     return pd.DataFrame(records).groupby("Key", as_index=False).sum()
 
 # --- 3. SERVTRACKER PROCESSOR ---
@@ -119,7 +123,7 @@ with col2:
     well_file = st.file_uploader("2. WellSky File", type=["xls", "xlsx", "csv"])
 
 if serv_file and well_file:
-    with st.spinner("Processing reports..."):
+    with st.spinner("Reconciling units..."):
         df_s = process_servtracker(serv_file)
         df_w = scan_wellsky(well_file)
 
@@ -127,7 +131,7 @@ if serv_file and well_file:
         # Step 1: Exact Match
         final = pd.merge(df_s, df_w, on="Key", how="left").fillna(0)
         
-        # Step 2: Fuzzy Match for remaining discrepancies
+        # Step 2: Fuzzy Match for missing keys
         unmatched_idx = final[final["Well"] == 0].index
         used_well_keys = final[final["Well"] > 0]["Key"].tolist()
         available_well = df_w[~df_w["Key"].isin(used_well_keys)]
@@ -148,16 +152,19 @@ if serv_file and well_file:
         
         # Dashboard
         m1, m2, m3 = st.columns(3)
-        m1.metric("Total Clients (Servtracker)", len(df_s))
+        m1.metric("Total Servtracker Clients", len(df_s))
         m2.metric("Perfect Matches", len(df_s) - len(discrepancies))
-        m3.metric("Discrepancies", len(discrepancies), delta_color="inverse")
+        m3.metric("Discrepancies Found", len(discrepancies), delta_color="inverse")
 
         st.subheader("Discrepancy Table")
         if not discrepancies.empty:
-            st.dataframe(discrepancies[["Name", "Serv", "Well", "Diff"]].sort_values("Diff", ascending=False), use_container_width=True)
+            st.dataframe(
+                discrepancies[["Name", "Serv", "Well", "Diff"]].sort_values("Diff", ascending=False), 
+                use_container_width=True
+            )
         else:
-            st.success("Success! All records are reconciled.")
+            st.success("✅ Perfect Match! No discrepancies found.")
 
-        # Download
+        # Download Report
         csv_data = final.to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Download Final Report", csv_data, "Reconciliation_Final.csv", "text/csv")
+        st.download_button("📥 Download Final Report", csv_data, "Reconciliation_Results.csv", "text/csv")
