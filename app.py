@@ -4,7 +4,8 @@ import re
 import difflib
 import io
 
-st.set_page_config(page_title="Healthcare Data Reconciler", layout="wide")
+st.set_page_config(page_title="Data Matcher Pro", layout="wide")
+st.title("📊 Servtracker vs. WellSky Final Reconciliation")
 
 # --- 1. THE KEY GENERATOR (The "Secret Sauce") ---
 def get_clean_key(last, first):
@@ -12,18 +13,17 @@ def get_clean_key(last, first):
     def clean(text):
         if pd.isna(text): return ""
         text = str(text).lower()
-        # Remove common suffixes that cause mismatches (jr, sr, etc.)
+        # Aggressively remove suffixes
         text = re.sub(r'\b(jr|sr|ii|iii|iv|v)\b', '', text)
-        # Keep only letters
+        # Keep only letters (removes spaces, hyphens, periods)
         return re.sub(r'[^a-z]', '', text)
     
-    # Only take the first word of the first name (ignores middle initials)
-    first_name = str(first).split()[0] if first and not pd.isna(first) else ""
+    # Only use the first word of the first name field (ignores middle initials)
+    first_name = str(first).strip().split()[0] if first and not pd.isna(first) else ""
     return clean(last) + clean(first_name)
 
-# --- 2. WELLSKY SCANNER (Stateful logic) ---
+# --- 2. WELLSKY SCANNER (Stateful Memory Logic) ---
 def scan_wellsky(file):
-    # Read the file without headers as it is non-tabular
     if file.name.lower().endswith('.csv'):
         df = pd.read_csv(file, header=None, encoding="latin1")
     else:
@@ -33,34 +33,40 @@ def scan_wellsky(file):
     current_key = None
     
     for _, row in df.iterrows():
-        # Check for Name Row (usually contains Client ID in col 1 and Last Name in col 5)
-        # Based on snippet: Col 5 = Last, Col 9 = First
-        last_name = str(row.iloc[5]).strip() if len(row) > 5 else ""
-        first_name = str(row.iloc[9]).strip() if len(row) > 9 else ""
+        # WellSky Format: Col 1 = ID, Col 5 = Last Name, Col 9 = First Name
+        # Identify a 'Name Row'
+        last_val = str(row.iloc[5]).strip() if len(row) > 5 else ""
+        first_val = str(row.iloc[9]).strip() if len(row) > 9 else ""
+        id_val = str(row.iloc[1]).strip() if len(row) > 1 else ""
         
-        # Identify if this is a name row (names should be alphabetic and not 'Last Name' header)
-        if last_name and last_name != "nan" and last_name != "Last Name" and any(c.isalpha() for c in last_name):
-            current_key = get_clean_key(last_name, first_name)
+        # Check if this row contains a client (ID is numeric and Last Name is present)
+        is_name_row = id_val.replace('.0','').isdigit() and last_val.lower() not in ["nan", "last name", ""]
         
-        # Look for "Sub Total:" in the row
-        row_str = " ".join([str(x).lower() for x in row.values if pd.notna(x)])
-        if "sub total:" in row_str and current_key:
-            # The units are usually in the columns following 'Sub Total:'
-            # We look for the first valid numeric value after the 'Sub Total' string
+        if is_name_row:
+            current_key = get_clean_key(last_val, first_val)
+            
+        # Identify a 'Sub Total Row'
+        row_content = " ".join([str(x).lower() for x in row.values if pd.notna(x)])
+        if "sub total:" in row_content and current_key:
+            # Extract units: find the first positive number in the row
+            # (Usually units appear before the cost/billing amounts)
             for val in row.values:
                 try:
-                    clean_val = re.sub(r'[^\d.]', '', str(val))
-                    if clean_val and clean_val != '.':
-                        units = float(clean_val)
-                        if 0 < units < 1000: # Filter out IDs or Currency
-                            records.append({"Key": current_key, "Well": units})
-                            current_key = None # Reset for next client
-                            break
+                    num_str = re.sub(r'[^\d.]', '', str(val))
+                    if num_str and num_str != '.':
+                        num_val = float(num_str)
+                        if 0 < num_val < 1000: # Filter out IDs or Currency outliers
+                            records.append({"Key": current_key, "Well": num_val})
+                            # We don't reset current_key immediately in case of multiple sub-totals,
+                            # it will be overwritten by the next client's name row.
+                            break 
                 except:
                     continue
-                    
-    if not records: return pd.DataFrame(columns=["Key", "Well"])
-    # Group by key in case of duplicate entries
+
+    if not records: 
+        return pd.DataFrame(columns=["Key", "Well"])
+    
+    # Group by key to sum up units if a client has multiple sub-total entries
     return pd.DataFrame(records).groupby("Key", as_index=False).sum()
 
 # --- 3. SERVTRACKER PROCESSOR ---
@@ -70,20 +76,20 @@ def process_servtracker(file):
     else:
         df = pd.read_excel(file, header=None)
     
-    # Find the 'Totals' column by scanning the first 10 rows
+    # Find the 'Totals' column dynamically
     totals_col = None
-    for row_idx in range(min(10, len(df))):
-        row_values = [str(x) for x in df.iloc[row_idx]]
-        if 'Totals' in row_values:
-            totals_col = row_values.index('Totals')
+    for row_idx in range(min(15, len(df))):
+        vals = [str(v).strip() for v in df.iloc[row_idx]]
+        if 'Totals' in vals:
+            totals_col = vals.index('Totals')
             break
     
     if totals_col is None:
-        st.error("Could not find 'Totals' column in Servtracker file.")
+        st.error("Error: Could not find 'Totals' column in Servtracker report.")
         return pd.DataFrame()
 
     records = []
-    # Start from row 5 as per instructions
+    # Data starts at Row 6 (index 5)
     for _, row in df.iloc[5:].iterrows():
         full_name = str(row.iloc[0]).strip()
         if "," not in full_name or "total" in full_name.lower() or full_name == "nan":
@@ -94,7 +100,7 @@ def process_servtracker(file):
             if pd.notna(val) and val > 0:
                 parts = full_name.split(",")
                 last = parts[0].strip()
-                first = parts[1].strip() if len(parts) > 1 else ""
+                first = parts[1].strip()
                 records.append({
                     "Name": full_name,
                     "Key": get_clean_key(last, first),
@@ -106,69 +112,52 @@ def process_servtracker(file):
     return pd.DataFrame(records)
 
 # --- 4. MAIN UI ---
-st.title("📊 Servtracker vs. WellSky Reconciliation")
-st.markdown("Upload both reports to identify discrepancies in monthly service units.")
-
 col1, col2 = st.columns(2)
 with col1:
-    serv_file = st.file_uploader("1. Servtracker File (Source A)", type=["xls", "xlsx", "csv"])
+    serv_file = st.file_uploader("1. Servtracker File", type=["xls", "xlsx", "csv"])
 with col2:
-    well_file = st.file_uploader("2. WellSky File (Source B)", type=["xls", "xlsx", "csv"])
+    well_file = st.file_uploader("2. WellSky File", type=["xls", "xlsx", "csv"])
 
 if serv_file and well_file:
-    with st.spinner("Processing files..."):
+    with st.spinner("Processing reports..."):
         df_s = process_servtracker(serv_file)
         df_w = scan_wellsky(well_file)
 
     if not df_s.empty and not df_w.empty:
-        # Initial Exact Key Match
+        # Step 1: Exact Match
         final = pd.merge(df_s, df_w, on="Key", how="left").fillna(0)
         
-        # Fuzzy Match Logic for Unmatched Records
+        # Step 2: Fuzzy Match for remaining discrepancies
         unmatched_idx = final[final["Well"] == 0].index
-        used_w_keys = final[final["Well"] > 0]["Key"].tolist()
-        avail_w = df_w[~df_w["Key"].isin(used_w_keys)]
+        used_well_keys = final[final["Well"] > 0]["Key"].tolist()
+        available_well = df_w[~df_w["Key"].isin(used_well_keys)]
         
-        if not avail_w.empty and len(unmatched_idx) > 0:
-            w_keys = avail_w["Key"].tolist()
+        if not available_well.empty and len(unmatched_idx) > 0:
+            well_keys = available_well["Key"].tolist()
             for idx in unmatched_idx:
                 s_key = final.at[idx, "Key"]
-                matches = difflib.get_close_matches(s_key, w_keys, n=1, cutoff=0.8)
+                matches = difflib.get_close_matches(s_key, well_keys, n=1, cutoff=0.8)
                 if matches:
                     match_key = matches[0]
-                    match_val = avail_w[avail_w["Key"] == match_key]["Well"].values[0]
+                    match_val = available_well[available_well["Key"] == match_key]["Well"].values[0]
                     final.at[idx, "Well"] = match_val
-                    w_keys.remove(match_key) # Don't reuse the same WellSky record
+                    well_keys.remove(match_key)
 
         final["Diff"] = final["Serv"] - final["Well"]
         discrepancies = final[final["Diff"] != 0].copy()
         
-        # Metrics Dashboard
+        # Dashboard
         m1, m2, m3 = st.columns(3)
-        m1.metric("Total Servtracker Clients", len(df_s))
+        m1.metric("Total Clients (Servtracker)", len(df_s))
         m2.metric("Perfect Matches", len(df_s) - len(discrepancies))
         m3.metric("Discrepancies", len(discrepancies), delta_color="inverse")
 
-        # Display Table
-        st.subheader("Discrepancy Report")
+        st.subheader("Discrepancy Table")
         if not discrepancies.empty:
-            # Highlight differences
-            st.dataframe(
-                discrepancies[["Name", "Serv", "Well", "Diff"]]
-                .sort_values("Diff", ascending=False),
-                use_container_width=True
-            )
+            st.dataframe(discrepancies[["Name", "Serv", "Well", "Diff"]].sort_values("Diff", ascending=False), use_container_width=True)
         else:
-            st.success("✅ All units match perfectly!")
+            st.success("Success! All records are reconciled.")
 
-        # Download Button
-        csv_buffer = io.StringIO()
-        final.to_csv(csv_buffer, index=False)
-        st.download_button(
-            label="📥 Download Final Reconciliation Report",
-            data=csv_buffer.getvalue(),
-            file_name="Reconciliation_Results.csv",
-            mime="text/csv",
-        )
-    else:
-        st.warning("Please ensure both files contain valid client data.")
+        # Download
+        csv_data = final.to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Download Final Report", csv_data, "Reconciliation_Final.csv", "text/csv")
